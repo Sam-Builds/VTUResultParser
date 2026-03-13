@@ -3,6 +3,7 @@ import os
 import queue
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -43,8 +44,9 @@ COLS = ["USN", "Name", "Subject Code", "Subject Name",
 
 INST_NAME      = "YENEPOYA INSTITUTE OF TECHNOLOGY"
 DEPT_NAME      = "Department of CSE(Data Science)"
-SHEET_TITLE    = "RESULT SHEET 2025-26 – Before Revaluation – I Sem"
-CREDIT_SHEET_TITLE = "RESULT SHEET 2025-26 – After Revaluation – Credit Points – I Sem"
+YEAR_PERIOD_DEFAULT = "2025-26"
+REVAL_DEFAULT = "Before Revaluation"
+SEM_DEFAULT = "I Sem"
 MAX_SUBJ_MARKS = 100  
 PASS_MARK      = 40   
 
@@ -55,7 +57,42 @@ def _thin_border():
     return Border(left=s, right=s, top=s, bottom=s)
 
 
-def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> Path:
+def _no_border():
+    s = Side(style=None)
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def _result_sheet_title(cfg: dict[str, str]) -> str:
+    return f"RESULT SHEET {cfg['year_period']} - {cfg['reval_status']} - {cfg['semester']}"
+
+
+def _credit_sheet_title(cfg: dict[str, str]) -> str:
+    return f"RESULT SHEET {cfg['year_period']} - {cfg['reval_status']} - Credit Points - {cfg['semester']}"
+
+
+def _save_excel(
+    rows: list,
+    out_dir: Path,
+    subject_credits: dict[str, int],
+    cfg: dict[str, str],
+    subject_order: list[str] | None = None,
+) -> Path:
+    def _is_fail_result(result_val: str) -> bool:
+        res = str(result_val or "").strip().upper()
+        if not res:
+            return False
+        return res != "P"
+
+    def _name_row_height(name_value: str, col_width: float) -> float:
+        text = str(name_value or "").strip()
+        if not text:
+            return 16
+        line_capacity = max(10, int(col_width - 2))
+        lines = 0
+        for part in text.splitlines() or [text]:
+            lines += max(1, (len(part) + line_capacity - 1) // line_capacity)
+        return max(16, min(45, 15 * lines))
+
     sorted_rows = sorted(rows, key=lambda r: (r.get("USN", ""), r.get("Subject Code", "")))
     student_order = []
     student_names = {}
@@ -65,11 +102,17 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
         code = r.get("Subject Code", "")
         if usn not in student_subjs:
             student_order.append(usn)
-            student_names[usn] = r.get("Name", "")
+            student_names[usn] = str(r.get("Name", "")).upper()
             student_subjs[usn] = {}
         student_subjs[usn][code] = r
 
-    all_codes = sorted({r.get("Subject Code", "") for r in rows if r.get("Subject Code", "")})
+    detected_codes = sorted({r.get("Subject Code", "") for r in rows if r.get("Subject Code", "")})
+    if subject_order:
+        ordered_valid = [c for c in subject_order if c in detected_codes]
+        missing = [c for c in detected_codes if c not in ordered_valid]
+        all_codes = ordered_valid + missing
+    else:
+        all_codes = detected_codes
     n_subj    = len(all_codes)
     cl = get_column_letter
     COL_SNO = 1
@@ -86,13 +129,14 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
     ctr_align  = Alignment(horizontal="center", vertical="center")
     left_align = Alignment(horizontal="left",   vertical="center", wrap_text=True)
     thin       = _thin_border()
+    no_border  = _no_border()
 
     wb = Workbook()
 
     def _write_title_block(ws, title_text: str, n_cols: int):
         for r_i, (text, fsize, row_h) in enumerate([
-            (INST_NAME, 14, 24),
-            (DEPT_NAME, 11, 20),
+            (cfg["inst_name"], 14, 24),
+            (cfg["dept_name"], 11, 20),
             (title_text, 11, 20),
         ], 1):
             ws.merge_cells(start_row=r_i, start_column=1, end_row=r_i, end_column=n_cols)
@@ -100,10 +144,17 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
             c.fill = white_fill
             c.font = Font(name="Segoe UI", size=fsize, bold=True, color="000000")
             c.alignment = Alignment(horizontal="center", vertical="center")
-            c.border = thin
+            c.border = no_border
             ws.row_dimensions[r_i].height = row_h
 
-    def _write_summary_block(ws, data_row: int, last_dr: int, tot_cols: list[int], col_fail: int):
+    def _write_summary_block(
+        ws,
+        data_row: int,
+        last_dr: int,
+        summary_stats: list[tuple[int, int, int]],
+        col_fail: int,
+        total_students: int,
+    ):
         summary_start = last_dr + 3
         summary_labels = [
             "SUBJECT",
@@ -137,13 +188,12 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
             c.alignment = ctr_align
             c.border = thin
 
-            tot_col = tot_cols[i]
-            tot_rng = f"{cl(tot_col)}{data_row}:{cl(tot_col)}{last_dr}"
-            ws.cell(summary_start + 1, col, f"=COUNT({tot_rng})")
-            ws.cell(summary_start + 2, col, f'=COUNTIF({tot_rng},">={PASS_MARK}")')
-            ws.cell(summary_start + 3, col, f'=COUNTIF({tot_rng},"<{PASS_MARK}")')
-            ws.cell(summary_start + 4, col,
-                    f"=IF({cl(col)}{summary_start + 1}=0,0,{cl(col)}{summary_start + 2}/{cl(col)}{summary_start + 1}*100)")
+            taking, passed, failed = summary_stats[i]
+            pct = 0 if taking == 0 else (passed / taking) * 100
+            ws.cell(summary_start + 1, col, taking)
+            ws.cell(summary_start + 2, col, passed)
+            ws.cell(summary_start + 3, col, failed)
+            ws.cell(summary_start + 4, col, pct)
 
             for row_no in range(summary_start + 1, summary_start + 5):
                 cell = ws.cell(row_no, col)
@@ -153,7 +203,6 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
                 cell.border = thin
             ws.cell(summary_start + 4, col).number_format = "0.00"
 
-        total_students = len(student_order)
         overall_subject_span_end = summary_col0 + max(n_subj - 1, 0)
         if n_subj:
             ws.merge_cells(start_row=summary_start + 5, start_column=summary_col0,
@@ -191,7 +240,7 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
     col_fail = col_pct + 1
     n_cols = col_fail
 
-    _write_title_block(ws, SHEET_TITLE, n_cols)
+    _write_title_block(ws, _result_sheet_title(cfg), n_cols)
 
     for col, text in [(COL_SNO, "S.No"), (COL_USN, "USN"), (COL_NAME, "STUDENT NAME")]:
         ws.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
@@ -238,7 +287,8 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
 
         wc(COL_SNO, s_idx + 1)
         wc(COL_USN, usn)
-        wc(COL_NAME, student_names.get(usn, ""), left_align)
+        student_name = student_names.get(usn, "")
+        wc(COL_NAME, student_name, left_align)
 
         for i, code in enumerate(all_codes):
             subj = student_subjs[usn].get(code, {})
@@ -253,26 +303,37 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
 
         wc(col_total, "=" + "+".join(f"{cl(c)}{dr}" for c in tot_cols), fmt="0")
         wc(col_pct, f"={cl(col_total)}{dr}/{n_subj * MAX_SUBJ_MARKS}*100", fmt="0.00")
-        fail_expr = "+".join(
-            f"ISNUMBER({cl(c)}{dr})*({cl(c)}{dr}<{PASS_MARK})" for c in tot_cols
+        fail_count = sum(
+            1
+            for code in all_codes
+            if _is_fail_result(student_subjs[usn].get(code, {}).get("Result", ""))
         )
-        wc(col_fail, f"={fail_expr}")
-        ws.row_dimensions[dr].height = 16
+        wc(col_fail, fail_count)
+        ws.row_dimensions[dr].height = _name_row_height(student_name, 30)
 
     last_dr = DATA_ROW + max(len(student_order) - 1, 0)
-    _write_summary_block(ws, DATA_ROW, last_dr, tot_cols, col_fail)
+    result_summary_stats = []
+    for code in all_codes:
+        taking = 0
+        passed = 0
+        failed = 0
+        for usn in student_order:
+            res = str(student_subjs[usn].get(code, {}).get("Result", "")).strip().upper()
+            if not res:
+                continue
+            taking += 1
+            if _is_fail_result(res):
+                failed += 1
+            else:
+                passed += 1
+        result_summary_stats.append((taking, passed, failed))
+    _write_summary_block(ws, DATA_ROW, last_dr, result_summary_stats, col_fail, len(student_order))
 
     ws.column_dimensions[cl(COL_SNO)].width = 5
     ws.column_dimensions[cl(COL_USN)].width = 14
     ws.column_dimensions[cl(COL_NAME)].width = 30
-    for i in range(n_subj):
-        c0 = COL_S0 + i * 3
-        ws.column_dimensions[cl(c0)].width = 5
-        ws.column_dimensions[cl(c0 + 1)].width = 5
-        ws.column_dimensions[cl(c0 + 2)].width = 5
-    ws.column_dimensions[cl(col_total)].width = 10
-    ws.column_dimensions[cl(col_pct)].width = 7
-    ws.column_dimensions[cl(col_fail)].width = 10
+    for col in range(COL_S0, n_cols + 1):
+        ws.column_dimensions[cl(col)].width = 10
     ws.freeze_panes = f"D{DATA_ROW}"
 
     ws_credit = wb.create_sheet("Credit Sheet")
@@ -286,7 +347,7 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
     c_n_cols = c_col_pct
     total_credits = sum(subject_credits.get(code, 0) for code in all_codes)
 
-    _write_title_block(ws_credit, CREDIT_SHEET_TITLE, c_n_cols)
+    _write_title_block(ws_credit, _credit_sheet_title(cfg), c_n_cols)
 
     for col, text in [(COL_SNO, "S.No"), (COL_USN, "USN"), (COL_NAME, "STUDENT NAME")]:
         ws_credit.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
@@ -337,7 +398,8 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
 
         wc_credit(COL_SNO, s_idx + 1)
         wc_credit(COL_USN, usn)
-        wc_credit(COL_NAME, student_names.get(usn, ""), left_align)
+        student_name = student_names.get(usn, "")
+        wc_credit(COL_NAME, student_name, left_align)
 
         for i, code in enumerate(all_codes):
             subj = student_subjs[usn].get(code, {})
@@ -368,10 +430,12 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
                   f"=IF({total_credits}=0,0,{cl(c_col_total_cp)}{dr}/{total_credits})",
                   fmt="0.00")
 
-        backlog_expr = "+".join(
-            f"ISNUMBER({cl(c)}{dr})*({cl(c)}{dr}<{PASS_MARK})" for c in credit_tot_cols
+        fail_count = sum(
+            1
+            for code in all_codes
+            if _is_fail_result(student_subjs[usn].get(code, {}).get("Result", ""))
         )
-        wc_credit(c_col_backlogs, f"={backlog_expr}")
+        wc_credit(c_col_backlogs, fail_count)
         wc_credit(c_col_remarks,
                   f'=IF({cl(c_col_backlogs)}{dr}=0,"PASS","FAIL")')
 
@@ -379,24 +443,16 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
         wc_credit(c_col_pct,
                   f"=({tot_sum_expr})/{n_subj * MAX_SUBJ_MARKS}*100",
                   fmt="0.00")
-        ws_credit.row_dimensions[dr].height = 16
+        ws_credit.row_dimensions[dr].height = _name_row_height(student_name, 30)
 
     c_last_dr = C_DATA_ROW + max(len(student_order) - 1, 0)
-    _write_summary_block(ws_credit, C_DATA_ROW, c_last_dr, credit_tot_cols, c_col_backlogs)
+    _write_summary_block(ws_credit, C_DATA_ROW, c_last_dr, result_summary_stats, c_col_backlogs, len(student_order))
 
     ws_credit.column_dimensions[cl(COL_SNO)].width = 5
     ws_credit.column_dimensions[cl(COL_USN)].width = 14
     ws_credit.column_dimensions[cl(COL_NAME)].width = 30
-    for i in range(n_subj):
-        c0 = C_COL_S0 + i * 3
-        ws_credit.column_dimensions[cl(c0)].width = 5
-        ws_credit.column_dimensions[cl(c0 + 1)].width = 5
-        ws_credit.column_dimensions[cl(c0 + 2)].width = 5
-    ws_credit.column_dimensions[cl(c_col_total_cp)].width = 10
-    ws_credit.column_dimensions[cl(c_col_sgpa)].width = 7
-    ws_credit.column_dimensions[cl(c_col_remarks)].width = 10
-    ws_credit.column_dimensions[cl(c_col_backlogs)].width = 14
-    ws_credit.column_dimensions[cl(c_col_pct)].width = 10
+    for col in range(C_COL_S0, c_n_cols + 1):
+        ws_credit.column_dimensions[cl(col)].width = 10
     ws_credit.freeze_panes = f"D{C_DATA_ROW}"
 
     ws2 = wb.create_sheet("Raw Data")
@@ -416,14 +472,22 @@ def _save_excel(rows: list, out_dir: Path, subject_credits: dict[str, int]) -> P
     data_font2 = Font(name="Segoe UI", size=10)
     for ri, r in enumerate(sorted_rows, 1):
         rf = white_fill
+        row_name = ""
         for ci, cn in enumerate(RAW_COLS, 1):
-            c = ws2.cell(ri + 1, ci, r.get(cn, ""))
+            val = r.get(cn, "")
+            if cn == "Name":
+                val = str(val).upper()
+                row_name = val
+            c = ws2.cell(ri + 1, ci, val)
             c.fill = rf; c.font = data_font2; c.border = thin
             c.alignment = left_align if cn in ("Name", "Subject Name") else ctr_align
-        ws2.row_dimensions[ri + 1].height = 16
+        ws2.row_dimensions[ri + 1].height = _name_row_height(row_name, raw_widths["Name"])
 
-    for ci, cn in enumerate(RAW_COLS, 1):
-        ws2.column_dimensions[cl(ci)].width = raw_widths[cn]
+    ws2.column_dimensions[cl(1)].width = raw_widths["USN"]
+    ws2.column_dimensions[cl(2)].width = raw_widths["Name"]
+    ws2.column_dimensions[cl(3)].width = raw_widths["Subject Code"]
+    for ci in range(4, len(RAW_COLS) + 1):
+        ws2.column_dimensions[cl(ci)].width = 10
     ws2.freeze_panes = "A2"
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -455,6 +519,15 @@ class VTUParserApp(TkinterDnD.Tk):
         self._busy = False
         self._q: queue.Queue = queue.Queue()
         self._last_credits: dict[str, int] = {}
+        self._last_sort_pos: dict[str, int] = {}
+
+        self._cfg_vars: dict[str, tk.StringVar] = {
+            "inst_name": tk.StringVar(value=INST_NAME),
+            "dept_name": tk.StringVar(value=DEPT_NAME),
+            "year_period": tk.StringVar(value=YEAR_PERIOD_DEFAULT),
+            "reval_status": tk.StringVar(value=REVAL_DEFAULT),
+            "semester": tk.StringVar(value=SEM_DEFAULT),
+        }
 
         self._build_ui()
         self._poll_queue()
@@ -470,26 +543,6 @@ class VTUParserApp(TkinterDnD.Tk):
 
         body = tk.Frame(self, bg=BG)
         body.pack(fill="both", expand=True, padx=24, pady=16)
-        self._zone = tk.Frame(body, bg=ACCENT_PALE,
-                              highlightbackground=ACCENT, highlightthickness=2)
-        self._zone.pack(fill="x", ipady=16)
-
-        tk.Label(self._zone, text="📂", font=("Segoe UI Emoji", 30),
-                 bg=ACCENT_PALE, fg=ACCENT).pack(pady=(12, 2))
-        tk.Label(self._zone, text="Drop a folder here",
-                 font=F_HEAD, bg=ACCENT_PALE, fg=ACCENT).pack()
-        tk.Label(self._zone, text="containing your VTU PDF marksheets",
-                 font=F_SMALL, bg=ACCENT_PALE, fg=T_MID).pack(pady=(0, 12))
-
-        self._zone.drop_target_register(DND_FILES)
-        self._zone.dnd_bind("<<DragEnter>>", self._drag_enter)
-        self._zone.dnd_bind("<<DragLeave>>", self._drag_leave)
-        self._zone.dnd_bind("<<Drop>>",      self._on_drop)
-        for child in self._zone.winfo_children():
-            child.drop_target_register(DND_FILES)
-            child.dnd_bind("<<DragEnter>>", self._drag_enter)
-            child.dnd_bind("<<DragLeave>>", self._drag_leave)
-            child.dnd_bind("<<Drop>>",      self._on_drop)
 
         ctrl = tk.Frame(body, bg=BG)
         ctrl.pack(fill="x", pady=(12, 0))
@@ -513,6 +566,40 @@ class VTUParserApp(TkinterDnD.Tk):
         self._lbl_count.pack(anchor="w")
 
         ttk.Separator(body, orient="horizontal").pack(fill="x", pady=12)
+
+        cfg_card = tk.Frame(body, bg=CARD, highlightbackground=BORDER_CLR, highlightthickness=1)
+        cfg_card.pack(fill="x", pady=(0, 10))
+
+        tk.Label(
+            cfg_card,
+            text="Sheet Configuration",
+            font=F_HEAD,
+            bg=CARD,
+            fg=T_DARK,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=6, sticky="w", padx=10, pady=(8, 6))
+
+        tk.Label(cfg_card, text="College", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=1, column=0, sticky="w", padx=(10, 6), pady=4)
+        tk.Entry(cfg_card, textvariable=self._cfg_vars["inst_name"], font=F_BODY, width=32).grid(row=1, column=1, sticky="w", padx=(0, 10), pady=4)
+
+        tk.Label(cfg_card, text="Department", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=1, column=2, sticky="w", padx=(4, 6), pady=4)
+        tk.Entry(cfg_card, textvariable=self._cfg_vars["dept_name"], font=F_BODY, width=30).grid(row=1, column=3, sticky="w", padx=(0, 10), pady=4)
+
+        tk.Label(cfg_card, text="Year Period", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=2, column=0, sticky="w", padx=(10, 6), pady=(2, 8))
+        tk.Entry(cfg_card, textvariable=self._cfg_vars["year_period"], font=F_BODY, width=14).grid(row=2, column=1, sticky="w", padx=(0, 10), pady=(2, 8))
+
+        tk.Label(cfg_card, text="Revaluation", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=2, column=2, sticky="w", padx=(4, 6), pady=(2, 8))
+        reval_box = ttk.Combobox(
+            cfg_card,
+            textvariable=self._cfg_vars["reval_status"],
+            state="readonly",
+            width=18,
+            values=["Before Revaluation", "After Revaluation"],
+        )
+        reval_box.grid(row=2, column=3, sticky="w", padx=(0, 10), pady=(2, 8))
+       
+        tk.Label(cfg_card, text="Semester", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=3, column=0, sticky="w", padx=(10, 6), pady=(2, 8))
+        tk.Entry(cfg_card, textvariable=self._cfg_vars["semester"], font=F_BODY, width=10).grid(row=3, column=1, sticky="w", padx=(0, 10), pady=(2, 8))
 
         self._progress_var = tk.DoubleVar(value=0)
         style = ttk.Style(self)
@@ -611,9 +698,32 @@ class VTUParserApp(TkinterDnD.Tk):
             self._btn_parse.configure(state="disabled")
             self._log_msg("No PDF files found in the selected folder.", "err")
 
+    def _read_export_config(self) -> dict[str, str] | None:
+        cfg = {
+            "inst_name": self._cfg_vars["inst_name"].get().strip(),
+            "dept_name": self._cfg_vars["dept_name"].get().strip(),
+            "year_period": self._cfg_vars["year_period"].get().strip(),
+            "reval_status": self._cfg_vars["reval_status"].get().strip(),
+            "semester": self._cfg_vars["semester"].get().strip(),
+        }
+        for key, label in [
+            ("inst_name", "College"),
+            ("dept_name", "Department"),
+            ("year_period", "Year Period"),
+            ("reval_status", "Revaluation"),
+            ("semester", "Semester"),
+        ]:
+            if not cfg[key]:
+                messagebox.showerror("Missing Configuration", f"{label} cannot be empty.")
+                return None
+        return cfg
+
 
     def _start_parse(self):
         if self._busy or not self._folder:
+            return
+        cfg = self._read_export_config()
+        if not cfg:
             return
         pdfs = sorted(self._folder.glob("*.pdf"))
         if not pdfs:
@@ -625,28 +735,41 @@ class VTUParserApp(TkinterDnD.Tk):
         self._progress_var.set(0)
         self._log_msg(f"\nStarting bulk parse of {len(pdfs)} file(s) …", "info")
         threading.Thread(target=self._worker,
-                         args=(pdfs,), daemon=True).start()
+                         args=(pdfs, cfg), daemon=True).start()
 
-    def _worker(self, pdfs: list):
+    def _worker(self, pdfs: list, cfg: dict[str, str]):
         all_rows = []
         errors   = []
         n        = len(pdfs)
 
-        for idx, pdf in enumerate(pdfs, 1):
-            self._q.put(("log",      f"[{idx}/{n}]  {pdf.name}", "info"))
-            self._q.put(("progress", int((idx - 1) / n * 100)))
+        max_workers = max(1, min(3, n, os.cpu_count() or 1))
+        self._q.put(("log", f"Parallel parsing enabled: {max_workers} worker(s)", "info"))
+
+        def _parse_single(pdf_path: Path):
             try:
-                rows = parse_scanned_vtu(str(pdf))
-                if rows:
-                    all_rows.extend(rows)
-                    self._q.put(("log",
-                                 f"       ✓  {len(rows)} subject(s) extracted.", "ok"))
-                else:
-                    self._q.put(("log",
-                                 "       ⚠  No subjects found — check scan quality.", "warn"))
+                rows = parse_scanned_vtu(str(pdf_path))
+                return pdf_path.name, rows, None
             except Exception as exc:
-                errors.append(pdf.name)
-                self._q.put(("log", f"       ✗  Error: {exc}", "err"))
+                return pdf_path.name, [], str(exc)
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_parse_single, pdf): pdf for pdf in pdfs}
+            for future in as_completed(futures):
+                completed += 1
+                pdf_name, rows, err = future.result()
+
+                self._q.put(("log", f"[{completed}/{n}]  {pdf_name}", "info"))
+                self._q.put(("progress", int(completed / n * 100)))
+
+                if err:
+                    errors.append(pdf_name)
+                    self._q.put(("log", f"        Error: {err}", "err"))
+                elif rows:
+                    all_rows.extend(rows)
+                    self._q.put(("log", f"        {len(rows)} subject(s) extracted.", "ok"))
+                else:
+                    self._q.put(("log", "        No subjects found — check scan quality.", "warn"))
 
         self._q.put(("progress", 100))
 
@@ -657,14 +780,15 @@ class VTUParserApp(TkinterDnD.Tk):
                 "errors": errors,
                 "total_files": n,
                 "subjects": subjects,
+                "cfg": cfg,
             }))
         else:
-            self._q.put(("log",      "\n✗  No data extracted from any PDF.", "err"))
+            self._q.put(("log",      "\nNo data extracted from any PDF.", "err"))
             self._q.put(("done_err", None))
 
-    def _export_worker(self, payload: dict, credits: dict[str, int]):
+    def _export_worker(self, payload: dict, credits: dict[str, int], subject_order: list[str]):
         try:
-            out = _save_excel(payload["rows"], self._folder, credits)
+            out = _save_excel(payload["rows"], self._folder, credits, payload["cfg"], subject_order)
             n = payload["total_files"]
             errors = payload["errors"]
             msg = (f"\nDone!  "
@@ -674,10 +798,10 @@ class VTUParserApp(TkinterDnD.Tk):
             self._q.put(("log", msg, "done"))
             self._q.put(("done_ok", str(out)))
         except Exception as exc:
-            self._q.put(("log", f"\n✗  Could not write Excel: {exc}", "err"))
+            self._q.put(("log", f"\nCould not write Excel: {exc}", "err"))
             self._q.put(("done_err", None))
 
-    def _prompt_subject_credits(self, subjects: list[str]) -> dict[str, int] | None:
+    def _prompt_subject_credits(self, subjects: list[str]) -> tuple[dict[str, int], list[str]] | None:
         dlg = tk.Toplevel(self)
         dlg.title("Subject Credits")
         dlg.configure(bg=BG)
@@ -690,32 +814,69 @@ class VTUParserApp(TkinterDnD.Tk):
 
         tk.Label(
             frm,
-            text="Enter credits for each subject (required before export):",
+            text="Enter credits and sort position for each subject (required before export):",
             font=F_HEAD,
             bg=BG,
             fg=T_DARK,
             anchor="w",
             justify="left",
-        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+
+        tk.Label(
+            frm,
+            text=f"Subjects detected: {len(subjects)}",
+            font=F_SMALL,
+            bg=BG,
+            fg=T_MID,
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 2))
+
+        default_order_preview = ", ".join(f"{idx}. {code}" for idx, code in enumerate(subjects, start=1))
+        tk.Label(
+            frm,
+            text=f"Current order: {default_order_preview}",
+            font=F_SMALL,
+            bg=BG,
+            fg=T_MID,
+            anchor="w",
+            justify="left",
+            wraplength=620,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
         vars_by_code: dict[str, tk.StringVar] = {}
+        sort_vars_by_code: dict[str, tk.StringVar] = {}
+
+        tk.Label(frm, text="Subject", font=F_SMALL, bg=BG, fg=T_MID).grid(row=3, column=0, sticky="w", padx=(0, 12), pady=(0, 2))
+        tk.Label(frm, text="Credit", font=F_SMALL, bg=BG, fg=T_MID).grid(row=3, column=1, sticky="w", padx=(0, 12), pady=(0, 2))
+        tk.Label(frm, text="Sort Pos", font=F_SMALL, bg=BG, fg=T_MID).grid(row=3, column=2, sticky="w", pady=(0, 2))
+
         for idx, code in enumerate(subjects, start=1):
+            row_idx = idx + 3
             tk.Label(frm, text=code, font=F_BODY, bg=BG, fg=T_DARK).grid(
-                row=idx, column=0, sticky="w", padx=(0, 12), pady=3
+                row=row_idx, column=0, sticky="w", padx=(0, 12), pady=3
             )
             default = str(self._last_credits.get(code, ""))
             var = tk.StringVar(value=default)
             ent = tk.Entry(frm, textvariable=var, width=8, font=F_BODY)
-            ent.grid(row=idx, column=1, sticky="w", pady=3)
+            ent.grid(row=row_idx, column=1, sticky="w", pady=3)
             vars_by_code[code] = var
+
+            default_sort = str(self._last_sort_pos.get(code, idx))
+            sort_var = tk.StringVar(value=default_sort)
+            sort_ent = tk.Entry(frm, textvariable=sort_var, width=8, font=F_BODY)
+            sort_ent.grid(row=row_idx, column=2, sticky="w", pady=3)
+            sort_vars_by_code[code] = sort_var
+
             if idx == 1:
                 ent.focus_set()
 
-        result: dict[str, int] | None = None
+        result: tuple[dict[str, int], list[str]] | None = None
 
         def on_submit():
             nonlocal result
             credits: dict[str, int] = {}
+            positions: dict[str, int] = {}
+            used_positions: set[int] = set()
             for code in subjects:
                 raw = vars_by_code[code].get().strip()
                 if raw == "":
@@ -725,14 +886,27 @@ class VTUParserApp(TkinterDnD.Tk):
                     messagebox.showerror("Invalid Credit", f"Credit must be a non-negative integer for {code}", parent=dlg)
                     return
                 credits[code] = int(raw)
-            result = credits
+
+                raw_pos = sort_vars_by_code[code].get().strip()
+                if raw_pos == "" or not raw_pos.isdigit() or int(raw_pos) <= 0:
+                    messagebox.showerror("Invalid Sort Position", f"Sort position must be a positive integer for {code}", parent=dlg)
+                    return
+                pos = int(raw_pos)
+                if pos in used_positions:
+                    messagebox.showerror("Duplicate Sort Position", f"Sort position {pos} is duplicated.", parent=dlg)
+                    return
+                used_positions.add(pos)
+                positions[code] = pos
+
+            ordered_subjects = [code for code, _ in sorted(positions.items(), key=lambda kv: kv[1])]
+            result = (credits, ordered_subjects)
             dlg.destroy()
 
         def on_cancel():
             dlg.destroy()
 
         btns = tk.Frame(frm, bg=BG)
-        btns.grid(row=len(subjects) + 1, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=len(subjects) + 5, column=0, columnspan=4, sticky="e", pady=(12, 0))
         tk.Button(btns, text="Cancel", font=F_BODY, command=on_cancel, width=10).pack(side="right")
         tk.Button(btns, text="Export", font=F_BODY, command=on_submit, width=10).pack(side="right", padx=(0, 8))
 
@@ -752,19 +926,21 @@ class VTUParserApp(TkinterDnD.Tk):
                     self._progress_var.set(item[1])
                 elif kind == "need_credits":
                     payload = item[1]
-                    credits = self._prompt_subject_credits(payload["subjects"])
-                    if not credits:
-                        self._log_msg("\n✗  Export cancelled: credits were not provided.", "err")
+                    picked = self._prompt_subject_credits(payload["subjects"])
+                    if not picked:
+                        self._log_msg("\nExport cancelled: credits were not provided.", "err")
                         self._busy = False
                         self._btn_parse.configure(state="normal",
                                                   text="  Parse & Export to Excel  ")
                         self._btn_browse.configure(state="normal")
                     else:
+                        credits, subject_order = picked
                         self._last_credits = credits
+                        self._last_sort_pos = {code: idx for idx, code in enumerate(subject_order, start=1)}
                         self._log_msg("Credits captured. Preparing workbook ...", "info")
                         threading.Thread(
                             target=self._export_worker,
-                            args=(payload, credits),
+                            args=(payload, credits, subject_order),
                             daemon=True,
                         ).start()
                 elif kind == "done_ok":
