@@ -1,0 +1,1097 @@
+
+import os
+import queue
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+from tkinter import filedialog, messagebox
+import tkinter as tk
+from tkinter import ttk
+
+from tkinterdnd2 import DND_FILES, TkinterDnD
+
+sys.path.insert(0, str(Path(__file__).parent))
+from pdfparser import parse_scanned_vtu
+
+
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+
+    return os.path.join(base_path, relative_path)
+
+W, H         = 700, 620
+BG           = "#f5f7fa"
+CARD         = "#ffffff"
+ACCENT       = "#1a73e8"
+ACCENT_DK    = "#1558b0"
+ACCENT_PALE  = "#e8f0fe"
+ACCENT_HOVER = "#d2e3fc"
+T_DARK       = "#202124"
+T_MID        = "#5f6368"
+T_LIGHT      = "#9aa0a6"
+BORDER_CLR   = "#dadce0"
+OK_CLR       = "#1e8e3e"
+ERR_CLR      = "#d93025"
+WARN_CLR     = "#f9ab00"
+
+F_TITLE  = ("Segoe UI", 17, "bold")
+F_HEAD   = ("Segoe UI", 11, "bold")
+F_BODY   = ("Segoe UI", 10)
+F_SMALL  = ("Segoe UI", 9)
+F_LOG    = ("Consolas", 9)
+
+COLS = ["USN", "Name", "Subject Code", "Subject Name",
+        "Internal", "External", "Total", "Result"]
+
+INST_NAME      = "YENEPOYA INSTITUTE OF TECHNOLOGY"
+DEPT_NAME      = "Department of CSE(Data Science)"
+YEAR_PERIOD_DEFAULT = "2025-26"
+REVAL_DEFAULT = "Before Revaluation"
+SEM_DEFAULT = "I Sem"
+MAX_SUBJ_MARKS = 100  
+PASS_MARK      = 40   
+
+
+
+def _thin_border():
+    s = Side(style="thin", color="BFBFBF")
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def _no_border():
+    s = Side(style=None)
+    return Border(left=s, right=s, top=s, bottom=s)
+
+
+def _result_sheet_title(cfg: dict[str, str]) -> str:
+    return f"RESULT SHEET {cfg['year_period']} - {cfg['reval_status']} - {cfg['semester']}"
+
+
+def _credit_sheet_title(cfg: dict[str, str]) -> str:
+    return f"RESULT SHEET {cfg['year_period']} - {cfg['reval_status']} - Credit Points - {cfg['semester']}"
+
+
+def _save_excel(
+    rows: list,
+    out_dir: Path,
+    subject_credits: dict[str, int],
+    cfg: dict[str, str],
+    subject_order: list[str] | None = None,
+    highlight_mapping: dict[str, bool] | None = None,
+) -> Path:
+
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    def _is_fail_result(result_val: str) -> bool:
+        res = str(result_val or "").strip().upper()
+        if not res:
+            return False
+        return res != "P"
+
+    def _name_row_height(name_value: str, col_width: float) -> float:
+        text = str(name_value or "").strip()
+        if not text:
+            return 16
+        line_capacity = max(10, int(col_width - 2))
+        lines = 0
+        for part in text.splitlines() or [text]:
+            lines += max(1, (len(part) + line_capacity - 1) // line_capacity)
+        return max(16, min(45, 15 * lines))
+
+    sorted_rows = sorted(rows, key=lambda r: (r.get("USN", ""), r.get("Subject Code", "")))
+    student_order = []
+    student_names = {}
+    student_subjs = {}      
+    for r in sorted_rows:
+        usn  = r.get("USN", "")
+        code = r.get("Subject Code", "")
+        if usn not in student_subjs:
+            student_order.append(usn)
+            student_names[usn] = str(r.get("Name", "")).upper()
+            student_subjs[usn] = {}
+        student_subjs[usn][code] = r
+
+    detected_codes = sorted({r.get("Subject Code", "") for r in rows if r.get("Subject Code", "")})
+    if subject_order:
+        ordered_valid = [c for c in subject_order if c in detected_codes]
+        missing = [c for c in detected_codes if c not in ordered_valid]
+        all_codes = ordered_valid + missing
+    else:
+        all_codes = detected_codes
+    n_subj    = len(all_codes)
+    cl = get_column_letter
+    COL_SNO = 1
+    COL_USN = 2
+    COL_NAME = 3
+    white_fill  = PatternFill("solid", fgColor="FFFFFF")
+
+    hdr_font    = Font(bold=True, color="000000", name="Segoe UI", size=9)
+    sub_font    = Font(bold=True, color="000000", name="Segoe UI", size=8)
+    data_font   = Font(name="Segoe UI", size=9)
+    title_font  = Font(name="Segoe UI", size=11, bold=True, color="000000")
+
+    hdr_align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    ctr_align  = Alignment(horizontal="center", vertical="center")
+    left_align = Alignment(horizontal="left",   vertical="center", wrap_text=True)
+    thin       = _thin_border()
+    no_border  = _no_border()
+
+    wb = Workbook()
+
+    def _write_title_block(ws, title_text: str, n_cols: int):
+        for r_i, (text, fsize, row_h) in enumerate([
+            (cfg["inst_name"], 14, 24),
+            (cfg["dept_name"], 11, 20),
+            (title_text, 11, 20),
+        ], 1):
+            ws.merge_cells(start_row=r_i, start_column=1, end_row=r_i, end_column=n_cols)
+            c = ws.cell(r_i, 1, text)
+            c.fill = white_fill
+            c.font = Font(name="Segoe UI", size=fsize, bold=True, color="000000")
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            c.border = no_border
+            ws.row_dimensions[r_i].height = row_h
+
+    def _write_summary_block(
+        ws,
+        data_row: int,
+        last_dr: int,
+        summary_stats: list[tuple[int, int, int]],
+        col_fail: int,
+        total_students: int,
+    ):
+        summary_start = last_dr + 3
+        summary_labels = [
+            "SUBJECT",
+            "NO. OF STUDENTS TAKING THE EXAM",
+            "NO. OF STUDENTS PASS IN THE PAPER",
+            "NO. OF STUDENTS FAIL IN THE PAPER",
+            "RESULT IN PERCENTAGE (%)",
+            "NO. OF STUDENTS PASSED IN ALL SUBJECTS",
+            "NO OF STUDENTS FAIL",
+            "RESULT IN PERCENTAGE (%)",
+        ]
+
+        summary_col0 = 4
+        for idx, label in enumerate(summary_labels):
+            row_no = summary_start + idx
+            ws.merge_cells(start_row=row_no, start_column=1, end_row=row_no, end_column=3)
+            c = ws.cell(row_no, 1, label)
+            c.fill = white_fill
+            c.font = hdr_font if idx == 0 else title_font
+            c.alignment = left_align if idx > 0 else hdr_align
+            c.border = thin
+            for extra_col in range(2, 4):
+                ws.cell(row_no, extra_col).fill = white_fill
+                ws.cell(row_no, extra_col).border = thin
+
+        for i, code in enumerate(all_codes):
+            col = summary_col0 + i
+            c = ws.cell(summary_start, col, code)
+            c.fill = white_fill
+            c.font = hdr_font
+            c.alignment = ctr_align
+            c.border = thin
+
+            taking, passed, failed = summary_stats[i]
+            pct = 0 if taking == 0 else (passed / taking) * 100
+            ws.cell(summary_start + 1, col, taking)
+            ws.cell(summary_start + 2, col, passed)
+            ws.cell(summary_start + 3, col, failed)
+            ws.cell(summary_start + 4, col, pct)
+
+            for row_no in range(summary_start + 1, summary_start + 5):
+                cell = ws.cell(row_no, col)
+                cell.fill = white_fill
+                cell.font = data_font
+                cell.alignment = ctr_align
+                cell.border = thin
+            ws.cell(summary_start + 4, col).number_format = "0.00"
+
+        overall_subject_span_end = summary_col0 + max(n_subj - 1, 0)
+        if n_subj:
+            ws.merge_cells(start_row=summary_start + 5, start_column=summary_col0,
+                           end_row=summary_start + 5, end_column=overall_subject_span_end)
+            ws.merge_cells(start_row=summary_start + 6, start_column=summary_col0,
+                           end_row=summary_start + 6, end_column=overall_subject_span_end)
+            ws.merge_cells(start_row=summary_start + 7, start_column=summary_col0,
+                           end_row=summary_start + 7, end_column=overall_subject_span_end)
+
+        ws.cell(summary_start + 5, summary_col0,
+                f'=COUNTIF({cl(col_fail)}{data_row}:{cl(col_fail)}{last_dr},0)')
+        ws.cell(summary_start + 6, summary_col0,
+                f'=COUNTIF({cl(col_fail)}{data_row}:{cl(col_fail)}{last_dr},">0")')
+        ws.cell(summary_start + 7, summary_col0,
+                f"=IF({total_students}=0,0,{cl(summary_col0)}{summary_start + 5}/{total_students}*100)")
+
+        for row_no in range(summary_start + 5, summary_start + 8):
+            c = ws.cell(row_no, summary_col0)
+            c.fill = white_fill
+            c.font = data_font
+            c.alignment = ctr_align
+            c.border = thin
+            if row_no == summary_start + 7:
+                c.number_format = "0.00"
+            for col in range(summary_col0 + 1, overall_subject_span_end + 1):
+                ws.cell(row_no, col).fill = white_fill
+                ws.cell(row_no, col).border = thin
+
+    ws = wb.active
+    ws.title = "Result Sheet"
+    DATA_ROW = 6
+    COL_S0 = 4
+    col_total = COL_S0 + n_subj * 3
+    col_pct = col_total + 1
+    col_fail = col_pct + 1
+    n_cols = col_fail
+
+    _write_title_block(ws, _result_sheet_title(cfg), n_cols)
+
+    for col, text in [(COL_SNO, "S.No"), (COL_USN, "USN"), (COL_NAME, "STUDENT NAME")]:
+        ws.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
+        c = ws.cell(4, col, text)
+        c.fill = white_fill; c.font = hdr_font; c.alignment = hdr_align; c.border = thin
+
+    for i, code in enumerate(all_codes):
+        c0 = COL_S0 + i * 3
+        ws.merge_cells(start_row=4, start_column=c0, end_row=4, end_column=c0 + 2)
+        c = ws.cell(4, c0, code)
+        c.fill = white_fill; c.font = hdr_font; c.alignment = hdr_align; c.border = thin
+
+    for col, text in [
+        (col_total, "Total\nMarks"),
+        (col_pct, "%"),
+        (col_fail, "Total no.\nof Fail"),
+    ]:
+        ws.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
+        c = ws.cell(4, col, text)
+        c.fill = white_fill; c.font = hdr_font; c.alignment = hdr_align; c.border = thin
+    ws.row_dimensions[4].height = 30
+
+    for i in range(n_subj):
+        c0 = COL_S0 + i * 3
+        for off, lbl in enumerate(("INT", "EXT", "TOT")):
+            c = ws.cell(5, c0 + off, lbl)
+            c.fill = white_fill; c.font = sub_font; c.alignment = ctr_align; c.border = thin
+    ws.row_dimensions[5].height = 16
+
+    tot_cols = [COL_S0 + i * 3 + 2 for i in range(n_subj)]
+
+    for s_idx, usn in enumerate(student_order):
+        dr = DATA_ROW + s_idx
+
+        def wc(col, val, align=ctr_align, fmt=None, fill_color=white_fill, _dr=dr):
+            c = ws.cell(_dr, col, val)
+            c.fill = fill_color
+            c.font = data_font
+            c.alignment = align
+            c.border = thin
+            if fmt:
+                c.number_format = fmt
+            return c
+
+        wc(COL_SNO, s_idx + 1)
+        wc(COL_USN, usn)
+        student_name = student_names.get(usn, "")
+        wc(COL_NAME, student_name, left_align)
+
+        for i, code in enumerate(all_codes):
+            subj = student_subjs[usn].get(code, {})
+            c0 = COL_S0 + i * 3
+            
+            is_highlighted_fail = False
+            raw_ext = subj.get("External", "")
+            if highlight_mapping and highlight_mapping.get(code, False):
+                try:
+                    ext_val = int(raw_ext)
+                    if ext_val < 18:
+                        is_highlighted_fail = True
+                except (ValueError, TypeError):
+                    pass
+            
+            cell_fill = PatternFill("solid", fgColor="FFCCCC") if is_highlighted_fail else white_fill
+            
+            for off, key in enumerate(("Internal", "External", "Total")):
+                raw = subj.get(key, "")
+                try:
+                    val = int(raw) if raw != "" else ""
+                except (ValueError, TypeError):
+                    val = raw
+                wc(c0 + off, val, fill_color=cell_fill)
+
+        wc(col_total, "=" + "+".join(f"{cl(c)}{dr}" for c in tot_cols), fmt="0")
+        wc(col_pct, f"={cl(col_total)}{dr}/{n_subj * MAX_SUBJ_MARKS}*100", fmt="0.00")
+        fail_count = sum(
+            1
+            for code in all_codes
+            if _is_fail_result(student_subjs[usn].get(code, {}).get("Result", ""))
+        )
+        wc(col_fail, fail_count)
+        ws.row_dimensions[dr].height = _name_row_height(student_name, 30)
+
+    last_dr = DATA_ROW + max(len(student_order) - 1, 0)
+    result_summary_stats = []
+    for code in all_codes:
+        taking = 0
+        passed = 0
+        failed = 0
+        for usn in student_order:
+            res = str(student_subjs[usn].get(code, {}).get("Result", "")).strip().upper()
+            if not res:
+                continue
+            taking += 1
+            if _is_fail_result(res):
+                failed += 1
+            else:
+                passed += 1
+        result_summary_stats.append((taking, passed, failed))
+    _write_summary_block(ws, DATA_ROW, last_dr, result_summary_stats, col_fail, len(student_order))
+
+    ws.column_dimensions[cl(COL_SNO)].width = 5
+    ws.column_dimensions[cl(COL_USN)].width = 14
+    ws.column_dimensions[cl(COL_NAME)].width = 30
+    for col in range(COL_S0, n_cols + 1):
+        ws.column_dimensions[cl(col)].width = 10
+    ws.freeze_panes = f"D{DATA_ROW}"
+
+    ws_credit = wb.create_sheet("Credit Sheet")
+    C_DATA_ROW = 6
+    C_COL_S0 = 4
+    c_col_total_cp = C_COL_S0 + n_subj * 3
+    c_col_sgpa = c_col_total_cp + 1
+    c_col_remarks = c_col_sgpa + 1
+    c_col_backlogs = c_col_remarks + 1
+    c_col_pct = c_col_backlogs + 1
+    c_n_cols = c_col_pct
+    total_credits = sum(subject_credits.get(code, 0) for code in all_codes)
+
+    _write_title_block(ws_credit, _credit_sheet_title(cfg), c_n_cols)
+
+    for col, text in [(COL_SNO, "S.No"), (COL_USN, "USN"), (COL_NAME, "STUDENT NAME")]:
+        ws_credit.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
+        c = ws_credit.cell(4, col, text)
+        c.fill = white_fill; c.font = hdr_font; c.alignment = hdr_align; c.border = thin
+
+    for i, code in enumerate(all_codes):
+        c0 = C_COL_S0 + i * 3
+        ws_credit.merge_cells(start_row=4, start_column=c0, end_row=4, end_column=c0 + 2)
+        c = ws_credit.cell(4, c0, code)
+        c.fill = white_fill; c.font = hdr_font; c.alignment = hdr_align; c.border = thin
+
+    for col, text in [
+        (c_col_total_cp, "TOTAL CP"),
+        (c_col_sgpa, "SGPA"),
+        (c_col_remarks, "REMARKS"),
+        (c_col_backlogs, "No. of Backlogs"),
+        (c_col_pct, "Percentage"),
+    ]:
+        ws_credit.merge_cells(start_row=4, start_column=col, end_row=5, end_column=col)
+        c = ws_credit.cell(4, col, text)
+        c.fill = white_fill; c.font = hdr_font; c.alignment = hdr_align; c.border = thin
+    ws_credit.row_dimensions[4].height = 30
+
+    for i in range(n_subj):
+        c0 = C_COL_S0 + i * 3
+        for off, lbl in enumerate(("TOT", "GP", "CP")):
+            c = ws_credit.cell(5, c0 + off, lbl)
+            c.fill = white_fill; c.font = sub_font; c.alignment = ctr_align; c.border = thin
+    ws_credit.row_dimensions[5].height = 16
+
+    credit_tot_cols = [C_COL_S0 + i * 3 for i in range(n_subj)]
+    credit_gp_cols = [C_COL_S0 + i * 3 + 1 for i in range(n_subj)]
+    credit_cp_cols = [C_COL_S0 + i * 3 + 2 for i in range(n_subj)]
+
+    for s_idx, usn in enumerate(student_order):
+        dr = C_DATA_ROW + s_idx
+
+        def wc_credit(col, val, align=ctr_align, fmt=None, _dr=dr):
+            c = ws_credit.cell(_dr, col, val)
+            c.fill = white_fill
+            c.font = data_font
+            c.alignment = align
+            c.border = thin
+            if fmt:
+                c.number_format = fmt
+            return c
+
+        wc_credit(COL_SNO, s_idx + 1)
+        wc_credit(COL_USN, usn)
+        student_name = student_names.get(usn, "")
+        wc_credit(COL_NAME, student_name, left_align)
+
+        for i, code in enumerate(all_codes):
+            subj = student_subjs[usn].get(code, {})
+            c0 = C_COL_S0 + i * 3
+            raw_total = subj.get("Total", "")
+            try:
+                total_val = int(raw_total) if raw_total != "" else ""
+            except (ValueError, TypeError):
+                total_val = raw_total
+
+            wc_credit(c0, total_val)
+
+            tot_ref = f"{cl(c0)}{dr}"
+            gp_ref = f"{cl(c0 + 1)}{dr}"
+            credit = int(subject_credits.get(code, 0))
+            gp_formula = (
+                f'=IF(ISNUMBER({tot_ref}),IF({tot_ref}>=90,10,IF({tot_ref}>=80,9,'
+                f'IF({tot_ref}>=70,8,IF({tot_ref}>=60,7,IF({tot_ref}>=55,6,'
+                f'IF({tot_ref}>=50,5,IF({tot_ref}>=40,4,0))))))),"")'
+            )
+            wc_credit(c0 + 1, gp_formula)
+            wc_credit(c0 + 2, f'=IF({gp_ref}="","",{gp_ref}*{credit})')
+
+        wc_credit(c_col_total_cp,
+                  "=" + "+".join(f"{cl(c)}{dr}" for c in credit_cp_cols),
+                  fmt="0")
+        wc_credit(c_col_sgpa,
+                  f"=IF({total_credits}=0,0,{cl(c_col_total_cp)}{dr}/{total_credits})",
+                  fmt="0.00")
+
+        fail_count = sum(
+            1
+            for code in all_codes
+            if _is_fail_result(student_subjs[usn].get(code, {}).get("Result", ""))
+        )
+        wc_credit(c_col_backlogs, fail_count)
+        wc_credit(c_col_remarks,
+                  f'=IF({cl(c_col_backlogs)}{dr}=0,"PASS","FAIL")')
+
+        tot_sum_expr = "+".join(f"{cl(c)}{dr}" for c in credit_tot_cols)
+        wc_credit(c_col_pct,
+                  f"=({tot_sum_expr})/{n_subj * MAX_SUBJ_MARKS}*100",
+                  fmt="0.00")
+        ws_credit.row_dimensions[dr].height = _name_row_height(student_name, 30)
+
+    c_last_dr = C_DATA_ROW + max(len(student_order) - 1, 0)
+    _write_summary_block(ws_credit, C_DATA_ROW, c_last_dr, result_summary_stats, c_col_backlogs, len(student_order))
+
+    ws_credit.column_dimensions[cl(COL_SNO)].width = 5
+    ws_credit.column_dimensions[cl(COL_USN)].width = 14
+    ws_credit.column_dimensions[cl(COL_NAME)].width = 30
+    for col in range(C_COL_S0, c_n_cols + 1):
+        ws_credit.column_dimensions[cl(col)].width = 10
+    ws_credit.freeze_panes = f"D{C_DATA_ROW}"
+
+    ws2 = wb.create_sheet("Raw Data")
+    RAW_COLS = ["USN", "Name", "Subject Code", "Subject Name",
+                "Internal", "External", "Total", "Result"]
+    raw_widths = {
+        "USN": 16, "Name": 26, "Subject Code": 14, "Subject Name": 42,
+        "Internal": 10, "External": 10, "Total": 8, "Result": 8,
+    }
+    for ci, cn in enumerate(RAW_COLS, 1):
+        c = ws2.cell(1, ci, cn)
+        c.fill = white_fill
+        c.font = Font(bold=True, color="000000", name="Segoe UI", size=10)
+        c.alignment = hdr_align; c.border = thin
+    ws2.row_dimensions[1].height = 28
+
+    data_font2 = Font(name="Segoe UI", size=10)
+    for ri, r in enumerate(sorted_rows, 1):
+        rf = white_fill
+        row_name = ""
+        for ci, cn in enumerate(RAW_COLS, 1):
+            val = r.get(cn, "")
+            if cn == "Name":
+                val = str(val).upper()
+                row_name = val
+            c = ws2.cell(ri + 1, ci, val)
+            c.fill = rf; c.font = data_font2; c.border = thin
+            c.alignment = left_align if cn in ("Name", "Subject Name") else ctr_align
+        ws2.row_dimensions[ri + 1].height = _name_row_height(row_name, raw_widths["Name"])
+
+    ws2.column_dimensions[cl(1)].width = raw_widths["USN"]
+    ws2.column_dimensions[cl(2)].width = raw_widths["Name"]
+    ws2.column_dimensions[cl(3)].width = raw_widths["Subject Code"]
+    for ci in range(4, len(RAW_COLS) + 1):
+        ws2.column_dimensions[cl(ci)].width = 10
+    ws2.freeze_panes = "A2"
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out   = out_dir / f"VTU_Results_{stamp}.xlsx"
+    try:
+        wb.save(out)
+    except PermissionError:
+        out = out_dir / f"VTU_Results_{datetime.now().strftime('%Y%m%d_%H%M%S')}_new.xlsx"
+        wb.save(out)
+
+    return out
+
+
+
+class VTUParserApp(TkinterDnD.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title("VTU Bulk PDF Parser")
+        self.geometry(f"{W}x{H}")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        try:
+            img_path = resource_path("parser.png") 
+            icon_img = tk.PhotoImage(file=img_path)
+            self.iconphoto(False, icon_img)
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Icon Error", f"Could not load PNG icon:\nPath: {img_path}\nError: {e}")
+        self.update_idletasks()
+        x = (self.winfo_screenwidth()  - W) // 2
+        y = (self.winfo_screenheight() - H) // 2
+        self.geometry(f"{W}x{H}+{x}+{y}")
+
+        self._folder: Path | None = None
+        self._busy = False
+        self._q: queue.Queue = queue.Queue()
+        self._last_credits: dict[str, int] = {}
+        self._last_sort_pos: dict[str, int] = {}
+
+        self._cfg_vars: dict[str, tk.StringVar] = {
+            "inst_name": tk.StringVar(value=INST_NAME),
+            "dept_name": tk.StringVar(value=DEPT_NAME),
+            "year_period": tk.StringVar(value=YEAR_PERIOD_DEFAULT),
+            "reval_status": tk.StringVar(value=REVAL_DEFAULT),
+            "semester": tk.StringVar(value=SEM_DEFAULT),
+        }
+
+        self._build_ui()
+        self._poll_queue()
+        try:
+            import pyi_splash
+            pyi_splash.close()
+        except ImportError:
+            pass
+
+
+    def _build_ui(self):
+        hdr = tk.Frame(self, bg=ACCENT, height=60)
+        hdr.pack(fill="x")
+        hdr.pack_propagate(False)
+        tk.Label(hdr, text="VTU Bulk PDF Parser",
+                 font=F_TITLE, bg=ACCENT, fg="white").pack(side="left", padx=20)
+    
+
+        body = tk.Frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=24, pady=16)
+
+        ctrl = tk.Frame(body, bg=BG)
+        ctrl.pack(fill="x", pady=(12, 0))
+
+        self._btn_browse = tk.Button(
+            ctrl, text="  Browse Folder  ", font=F_HEAD,
+            bg=ACCENT, fg="white", activebackground=ACCENT_DK,
+            activeforeground="white", bd=0, padx=16, pady=8,
+            relief="flat", cursor="hand2", command=self._browse
+        )
+        self._btn_browse.pack(side="left")
+
+        info = tk.Frame(ctrl, bg=BG)
+        info.pack(side="left", padx=14)
+        self._lbl_path  = tk.Label(info, text="No folder selected.",
+                                   font=F_BODY, bg=BG, fg=T_MID,
+                                   anchor="w", wraplength=430, justify="left")
+        self._lbl_path.pack(anchor="w")
+        self._lbl_count = tk.Label(info, text="",
+                                   font=F_SMALL, bg=BG, fg=T_MID, anchor="w")
+        self._lbl_count.pack(anchor="w")
+
+        ttk.Separator(body, orient="horizontal").pack(fill="x", pady=12)
+
+        cfg_card = tk.Frame(body, bg=CARD, highlightbackground=BORDER_CLR, highlightthickness=1)
+        cfg_card.pack(fill="x", pady=(0, 10))
+
+        tk.Label(
+            cfg_card,
+            text="Sheet Configuration",
+            font=F_HEAD,
+            bg=CARD,
+            fg=T_DARK,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=6, sticky="w", padx=10, pady=(8, 6))
+
+        tk.Label(cfg_card, text="College", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=1, column=0, sticky="w", padx=(14, 6), pady=(8, 4))
+        ttk.Entry(cfg_card, textvariable=self._cfg_vars["inst_name"], font=F_BODY, width=32).grid(row=1, column=1, sticky="w", padx=(0, 14), pady=(8, 4))
+
+        tk.Label(cfg_card, text="Department", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=1, column=2, sticky="w", padx=(6, 6), pady=(8, 4))
+        ttk.Entry(cfg_card, textvariable=self._cfg_vars["dept_name"], font=F_BODY, width=30).grid(row=1, column=3, sticky="w", padx=(0, 14), pady=(8, 4))
+
+        tk.Label(cfg_card, text="Year Period", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=2, column=0, sticky="w", padx=(14, 6), pady=(4, 8))
+        ttk.Entry(cfg_card, textvariable=self._cfg_vars["year_period"], font=F_BODY, width=14).grid(row=2, column=1, sticky="w", padx=(0, 14), pady=(4, 8))
+
+        tk.Label(cfg_card, text="Revaluation", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=2, column=2, sticky="w", padx=(6, 6), pady=(4, 8))
+        reval_box = ttk.Combobox(
+            cfg_card,
+            textvariable=self._cfg_vars["reval_status"],
+            state="readonly",
+            width=18,
+            values=["Before Revaluation", "After Revaluation"],
+        )
+        reval_box.grid(row=2, column=3, sticky="w", padx=(0, 14), pady=(4, 8))
+       
+        tk.Label(cfg_card, text="Semester", font=F_SMALL, bg=CARD, fg=T_MID).grid(row=3, column=0, sticky="w", padx=(14, 6), pady=(4, 12))
+        ttk.Entry(cfg_card, textvariable=self._cfg_vars["semester"], font=F_BODY, width=10).grid(row=3, column=1, sticky="w", padx=(0, 14), pady=(4, 12))
+
+        self._progress_var = tk.DoubleVar(value=0)
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("Blue.Horizontal.TProgressbar",
+                        troughcolor=BORDER_CLR, bordercolor=BORDER_CLR,
+                        background=ACCENT, lightcolor=ACCENT, darkcolor=ACCENT_DK)
+        pb_frame = tk.Frame(body, bg=BG)
+        pb_frame.pack(fill="x")
+        ttk.Progressbar(pb_frame, length=W - 52, mode="determinate",
+                        maximum=100, variable=self._progress_var,
+                        style="Blue.Horizontal.TProgressbar").pack(fill="x")
+
+        log_outer = tk.Frame(body, bg=CARD,
+                             highlightbackground=BORDER_CLR, highlightthickness=1)
+        log_outer.pack(fill="both", expand=True, pady=(8, 0))
+
+        self._log = tk.Text(log_outer, height=10, font=F_LOG, bg=CARD,
+                            fg=T_DARK, bd=0, wrap="word",
+                            state="disabled", cursor="arrow",
+                            selectbackground=ACCENT_PALE)
+        sb = ttk.Scrollbar(log_outer, command=self._log.yview)
+        self._log.configure(yscrollcommand=sb.set)
+        self._log.pack(side="left", fill="both", expand=True, padx=8, pady=6)
+        sb.pack(side="right", fill="y")
+
+        self._log.tag_configure("ok",   foreground=OK_CLR)
+        self._log.tag_configure("err",  foreground=ERR_CLR)
+        self._log.tag_configure("warn", foreground=WARN_CLR)
+        self._log.tag_configure("info", foreground=T_MID)
+        self._log.tag_configure("done", foreground=ACCENT,
+                                font=("Segoe UI", 10, "bold"))
+
+        btn_row = tk.Frame(body, bg=BG)
+        btn_row.pack(pady=(10, 0))
+
+        self._btn_parse = tk.Button(
+            btn_row, text="  Parse & Export to Excel  ",
+            font=("Segoe UI", 12, "bold"),
+            bg=ACCENT, fg="white", activebackground=ACCENT_DK,
+            activeforeground="white", bd=0, padx=28, pady=12,
+            relief="flat", cursor="hand2", state="disabled",
+            command=self._start_parse
+        )
+        self._btn_parse.pack()
+
+
+    def _set_zone_bg(self, color):
+        self._zone.configure(bg=color)
+        for w in self._zone.winfo_children():
+            w.configure(bg=color)
+
+    def _drag_enter(self, event):
+        self._set_zone_bg(ACCENT_HOVER)
+
+    def _drag_leave(self, event):
+        self._set_zone_bg(ACCENT_PALE)
+
+    def _on_drop(self, event):
+        self._set_zone_bg(ACCENT_PALE)
+        try:
+            paths = self.tk.splitlist(event.data.strip())
+        except Exception:
+            paths = [event.data.strip().strip("{}")]
+
+        for raw in paths:
+            path = Path(raw)
+            if path.is_dir():
+                self._set_folder(path)
+                return
+        self._log_msg("Dropped item is not a folder — please drop a folder.", "err")
+
+
+    def _browse(self):
+        folder = filedialog.askdirectory(
+            title="Select folder containing VTU PDF marksheets"
+        )
+        if folder:
+            self._set_folder(Path(folder))
+
+    def _set_folder(self, path: Path):
+        self._folder = path
+        pdfs = sorted(path.glob("*.pdf"))
+        self._lbl_path.configure(text=str(path), fg=T_DARK)
+        if pdfs:
+            self._lbl_count.configure(
+                text=f"{len(pdfs)} PDF file(s) ready to parse.", fg=OK_CLR
+            )
+            self._btn_parse.configure(state="normal")
+            self._log_msg(f"Folder: {path}", "info")
+            names = ", ".join(p.name for p in pdfs[:6])
+            suffix = f" … (+{len(pdfs) - 6} more)" if len(pdfs) > 6 else ""
+            self._log_msg(f"PDFs found: {names}{suffix}", "info")
+        else:
+            self._lbl_count.configure(text="No PDF files found in this folder.", fg=ERR_CLR)
+            self._btn_parse.configure(state="disabled")
+            self._log_msg("No PDF files found in the selected folder.", "err")
+
+    def _read_export_config(self) -> dict[str, str] | None:
+        cfg = {
+            "inst_name": self._cfg_vars["inst_name"].get().strip(),
+            "dept_name": self._cfg_vars["dept_name"].get().strip(),
+            "year_period": self._cfg_vars["year_period"].get().strip(),
+            "reval_status": self._cfg_vars["reval_status"].get().strip(),
+            "semester": self._cfg_vars["semester"].get().strip(),
+        }
+        for key, label in [
+            ("inst_name", "College"),
+            ("dept_name", "Department"),
+            ("year_period", "Year Period"),
+            ("reval_status", "Revaluation"),
+            ("semester", "Semester"),
+        ]:
+            if not cfg[key]:
+                messagebox.showerror("Missing Configuration", f"{label} cannot be empty.")
+                return None
+        return cfg
+
+
+    def _start_parse(self):
+        if self._busy or not self._folder:
+            return
+        cfg = self._read_export_config()
+        if not cfg:
+            return
+        pdfs = sorted(self._folder.glob("*.pdf"))
+        if not pdfs:
+            messagebox.showwarning("No PDFs", "No PDF files found in the selected folder.")
+            return
+        self._busy = True
+        self._btn_parse.configure(state="disabled", text="  Processing…  ")
+        self._btn_browse.configure(state="disabled")
+        self._progress_var.set(0)
+        self._log_msg(f"\nStarting bulk parse of {len(pdfs)} file(s) …", "info")
+        threading.Thread(target=self._worker,
+                         args=(pdfs, cfg), daemon=True).start()
+
+    def _worker(self, pdfs: list, cfg: dict[str, str]):
+        all_rows = []
+        errors   = []
+        n        = len(pdfs)
+
+        max_workers = max(1, min(3, n, os.cpu_count() or 1))
+        self._q.put(("log", f"Parallel parsing enabled: {max_workers} worker(s)", "info"))
+
+        def _parse_single(pdf_path: Path):
+            try:
+                rows = parse_scanned_vtu(str(pdf_path))
+                return pdf_path.name, rows, None
+            except Exception as exc:
+                return pdf_path.name, [], str(exc)
+
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_parse_single, pdf): pdf for pdf in pdfs}
+            for future in as_completed(futures):
+                completed += 1
+                pdf_name, rows, err = future.result()
+
+                self._q.put(("log", f"[{completed}/{n}]  {pdf_name}", "info"))
+                self._q.put(("progress", int(completed / n * 100)))
+
+                if err:
+                    errors.append(pdf_name)
+                    self._q.put(("log", f"        Error: {err}", "err"))
+                elif rows:
+                    all_rows.extend(rows)
+                    self._q.put(("log", f"        {len(rows)} subject(s) extracted.", "ok"))
+                else:
+                    self._q.put(("log", "        No subjects found — check scan quality.", "warn"))
+
+        self._q.put(("progress", 100))
+
+        if all_rows:
+            subjects = sorted({r.get("Subject Code", "") for r in all_rows if r.get("Subject Code", "")})
+            self._q.put(("need_credits", {
+                "rows": all_rows,
+                "errors": errors,
+                "total_files": n,
+                "subjects": subjects,
+                "cfg": cfg,
+            }))
+        else:
+            self._q.put(("log",      "\nNo data extracted from any PDF.", "err"))
+            self._q.put(("done_err", None))
+
+    def _export_worker(self, payload: dict, credits: dict[str, int], subject_order: list[str], highlight_mapping: dict[str, bool]):
+        try:
+            out = _save_excel(payload["rows"], self._folder, credits, payload["cfg"], subject_order, highlight_mapping)
+            n = payload["total_files"]
+            errors = payload["errors"]
+            msg = (f"\nDone!  "
+                   f"{len(payload['rows'])} row(s) from "
+                   f"{n - len(errors)}/{n} file(s)\n"
+                   f"   Saved: {out.name}")
+            self._q.put(("log", msg, "done"))
+            self._q.put(("done_ok", str(out)))
+        except Exception as exc:
+            self._q.put(("log", f"\nCould not write Excel: {exc}", "err"))
+            self._q.put(("done_err", None))
+
+    def _prompt_subject_credits(self, subjects: list[str]) -> tuple[dict[str, int], list[str], dict[str, str], dict[str, bool]] | None:
+        dlg = tk.Toplevel(self)
+        dlg.title("Subject Credits")
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        frm = tk.Frame(dlg, bg=BG, padx=16, pady=12)
+        frm.pack(fill="both", expand=True)
+
+        tk.Label(
+            frm,
+            text="Enter credits and sort position for each subject (required before export):",
+            font=F_HEAD,
+            bg=BG,
+            fg=T_DARK,
+            anchor="w",
+            justify="left",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+
+        tk.Label(
+            frm,
+            text=f"Subjects detected: {len(subjects)}",
+            font=F_SMALL,
+            bg=BG,
+            fg=T_MID,
+            anchor="w",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 2))
+
+        default_order_preview = ", ".join(f"{idx}. {code}" for idx, code in enumerate(subjects, start=1))
+        tk.Label(
+            frm,
+            text=f"Current order: {default_order_preview}",
+            font=F_SMALL,
+            bg=BG,
+            fg=T_MID,
+            anchor="w",
+            justify="left",
+            wraplength=620,
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(0, 10))
+
+        select_all_var = tk.BooleanVar(value=True)
+        def toggle_select_all():
+            val = select_all_var.get()
+            for var in highlight_vars.values():
+                var.set(val)
+
+        header_frm = tk.Frame(frm, bg=BG)
+        header_frm.grid(row=3, column=0, columnspan=5, sticky="w", pady=(0, 4))
+        
+        tk.Label(header_frm, text="", font=F_BODY, bg=BG, width=3).pack(side="left", padx=(0, 8))
+        tk.Label(header_frm, text="", font=F_SMALL, bg=BG, fg=T_MID, width=5, anchor="center").pack(side="left", padx=(0, 8))
+        tk.Label(header_frm, text="", font=F_SMALL, bg=BG, fg=T_MID, width=15, anchor="w").pack(side="left", padx=(0, 12))
+        tk.Label(header_frm, text="Credit", font=F_SMALL, bg=BG, fg=T_MID, width=8, anchor="center").pack(side="left", padx=(8, 8))
+        cb_all = tk.Checkbutton(header_frm, text="Highlight <18", variable=select_all_var, command=toggle_select_all, font=F_SMALL, bg=BG, fg=T_MID)
+        cb_all.pack(side="left", padx=(14, 0))
+
+        list_frm = tk.Frame(frm, bg=BG)
+        list_frm.grid(row=4, column=0, columnspan=5, sticky="w", pady=5)
+        
+        ordered_subjects = list(subjects)
+        try:
+            ordered_subjects.sort(key=lambda c: self._last_sort_pos.get(c, 999))
+        except Exception:
+            pass
+            
+        credits_vars: dict[str, tk.StringVar] = {}
+        selected_vars: dict[str, tk.BooleanVar] = {}
+        highlight_vars: dict[str, tk.BooleanVar] = {}
+        combined_mapping: dict[str, str] = {}
+        drag_idx = None
+        
+        for code in ordered_subjects:
+            credits_vars[code] = tk.StringVar(value=str(self._last_credits.get(code, "")))
+            selected_vars[code] = tk.BooleanVar(value=False)
+            highlight_vars[code] = tk.BooleanVar(value=True)
+
+        def _render_list():
+            for w in list_frm.winfo_children():
+                w.destroy()
+            for i, code in enumerate(ordered_subjects):
+                is_dragged = drag_idx is not None and i == drag_idx
+                row_bg = ACCENT_PALE if is_dragged else BG
+                
+                row_frm = tk.Frame(list_frm, bg=row_bg)
+                row_frm.pack(fill="x", pady=2)
+                
+                lbl = tk.Label(row_frm, text="☰", font=F_BODY, bg=row_bg, fg=T_MID, cursor="fleur", width=3)
+                lbl.pack(side="left", padx=(0, 8))
+                
+                lbl.bind("<Button-1>", lambda e, idx=i: _start_drag(e, idx))
+                lbl.bind("<B1-Motion>", _do_drag)
+                lbl.bind("<ButtonRelease-1>", _stop_drag)
+                
+                chk_var = selected_vars[code]
+                chk = tk.Checkbutton(row_frm, variable=chk_var, bg=row_bg, width=5)
+                chk.pack(side="left", padx=(0, 8))
+                
+                tk.Label(row_frm, text=code, font=F_BODY, bg=row_bg, fg=T_DARK, width=15, anchor="w").pack(side="left", padx=(0, 12))
+                
+                ttk.Entry(row_frm, textvariable=credits_vars[code], width=8, font=F_BODY).pack(side="left", padx=(10, 8))
+                
+                hl_chk = tk.Checkbutton(row_frm, variable=highlight_vars[code], bg=row_bg)
+                hl_chk.pack(side="left", padx=(18, 0))
+                
+        def _start_drag(event, idx):
+            nonlocal drag_idx
+            drag_idx = idx
+            _render_list()
+            
+        def _do_drag(event):
+            pass
+            
+        def _stop_drag(event):
+            nonlocal drag_idx
+            if drag_idx is None: return
+            
+            y = event.y_root - list_frm.winfo_rooty()
+            row_height = 30
+            new_idx = int(y // row_height)
+            new_idx = max(0, min(new_idx, len(ordered_subjects) - 1))
+            
+            if new_idx != drag_idx:
+                subj = ordered_subjects.pop(drag_idx)
+                ordered_subjects.insert(new_idx, subj)
+                _render_list()
+            drag_idx = None
+
+        def _combine_selected():
+            selected = [code for code in ordered_subjects if selected_vars[code].get()]
+            if len(selected) != 2:
+                messagebox.showerror("Combine Error", "Please select exactly 2 subjects to combine.", parent=dlg)
+                return
+                
+            code1, code2 = selected
+            combined_code = f"{code1}/{code2}"
+            
+            idx1 = ordered_subjects.index(code1)
+            ordered_subjects.remove(code1)
+            ordered_subjects.remove(code2)
+            ordered_subjects.insert(idx1, combined_code)
+            
+            combined_mapping[code1] = combined_code
+            combined_mapping[code2] = combined_code
+            
+            credits_vars[combined_code] = tk.StringVar(value=credits_vars[code1].get())
+            selected_vars[combined_code] = tk.BooleanVar(value=False)
+            highlight_vars[combined_code] = tk.BooleanVar(value=False)
+            
+            del credits_vars[code1]
+            del credits_vars[code2]
+            del selected_vars[code1]
+            del selected_vars[code2]
+            del highlight_vars[code1]
+            del highlight_vars[code2]
+            
+            _render_list()
+
+        _render_list()
+
+        result: tuple[dict[str, int], list[str], dict[str, str], dict[str, bool]] | None = None
+
+        def on_submit():
+            nonlocal result
+            final_credits: dict[str, int] = {}
+            for code in ordered_subjects:
+                raw = credits_vars[code].get().strip()
+                if raw == "":
+                    messagebox.showerror("Missing Credit", f"Credit missing for {code}", parent=dlg)
+                    return
+                if not raw.isdigit():
+                    messagebox.showerror("Invalid Credit", f"Credit must be a non-negative integer for {code}", parent=dlg)
+                    return
+                final_credits[code] = int(raw)
+
+            final_highlights = {code: var.get() for code, var in highlight_vars.items()}
+            result = (final_credits, ordered_subjects, combined_mapping, final_highlights)
+            dlg.destroy()
+
+        def on_cancel():
+            dlg.destroy()
+
+        btns = tk.Frame(frm, bg=BG)
+        btns.grid(row=5, column=0, columnspan=5, sticky="e", pady=(12, 0))
+        tk.Button(btns, text="Combine Selected", font=F_BODY, command=_combine_selected).pack(side="left", padx=(0, 20))
+        tk.Button(btns, text="Cancel", font=F_BODY, command=on_cancel, width=10).pack(side="right")
+        tk.Button(btns, text="Export", font=F_BODY, command=on_submit, width=10).pack(side="right", padx=(0, 8))
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        self.wait_window(dlg)
+        return result
+
+
+    def _poll_queue(self):
+        try:
+            while True:
+                item = self._q.get_nowait()
+                kind = item[0]
+                if kind == "log":
+                    self._log_msg(item[1], item[2])
+                elif kind == "progress":
+                    self._progress_var.set(item[1])
+                elif kind == "need_credits":
+                    payload = item[1]
+                    picked = self._prompt_subject_credits(payload["subjects"])
+                    if not picked:
+                        self._log_msg("\nExport cancelled: credits were not provided.", "err")
+                        self._busy = False
+                        self._btn_parse.configure(state="normal",
+                                                  text="  Parse & Export to Excel  ")
+                        self._btn_browse.configure(state="normal")
+                    else:
+                        credits, subject_order, combined_mapping, highlight_mapping = picked
+                        self._last_credits = credits
+                        self._last_sort_pos = {code: idx for idx, code in enumerate(subject_order, start=1)}
+                        
+                        for row in payload["rows"]:
+                            code = row.get("Subject Code", "")
+                            if code in combined_mapping:
+                                row["Subject Code"] = combined_mapping[code]
+                                
+                        self._log_msg("Credits captured. Preparing workbook ...", "info")
+                        threading.Thread(
+                            target=self._export_worker,
+                            args=(payload, credits, subject_order, highlight_mapping),
+                            daemon=True,
+                        ).start()
+                elif kind == "done_ok":
+                    self._busy = False
+                    self._btn_parse.configure(state="normal",
+                                              text="  Parse & Export to Excel  ")
+                    self._btn_browse.configure(state="normal")
+                    messagebox.showinfo(
+                        "Export Complete",
+                        f"All results saved to:\n\n{item[1]}"
+                    )
+                elif kind == "done_err":
+                    self._busy = False
+                    self._btn_parse.configure(state="normal",
+                                              text="  Parse & Export to Excel  ")
+                    self._btn_browse.configure(state="normal")
+        except queue.Empty:
+            pass
+        self.after(80, self._poll_queue)
+
+
+    def _log_msg(self, text: str, tag: str = "info"):
+        self._log.configure(state="normal")
+        self._log.insert("end", text + "\n", tag)
+        self._log.see("end")
+        self._log.configure(state="disabled")
+
+
+if __name__ == "__main__":
+    app = VTUParserApp()
+    app.mainloop()
